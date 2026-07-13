@@ -163,6 +163,11 @@ async function renderList() {
             row.innerHTML =
                 '<span class="cmb-date">' + escapeHtml(it.date || '') + '</span> ' +
                 '<span class="cmb-text">' + escapeHtml(meta) + escapeHtml(it.note) + '</span>';
+            const chk = document.createElement('input');
+            chk.type = 'checkbox';
+            chk.className = 'cmb-chk';
+            chk.dataset.id = String(it.id);
+            row.insertAdjacentElement('afterbegin', chk);
             const edit = document.createElement('button');
             edit.textContent = '改';
             edit.className = 'cmb-edit menu_button';
@@ -223,6 +228,15 @@ function buildPanel() {
             <button id="cmb_import" class="menu_button">从 Horae 导入</button>
             <button id="cmb_refresh" class="menu_button">刷新列表</button>
           </div>
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <input id="cmb_new" class="text_pole" type="text" placeholder="手动新增一条记忆…" style="flex:1">
+            <button id="cmb_add" class="menu_button">新增</button>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <button id="cmb_selall" class="menu_button">全选</button>
+            <button id="cmb_selnone" class="menu_button">取消全选</button>
+            <button id="cmb_delsel" class="menu_button">删除选中</button>
+          </div>
           <div id="cmb_list" class="cmb-list"></div>
         </div>
       </div>
@@ -245,6 +259,35 @@ function buildPanel() {
     });
     document.getElementById('cmb_import').addEventListener('click', importFromHorae);
     document.getElementById('cmb_refresh').addEventListener('click', renderList);
+    document.getElementById('cmb_add').addEventListener('click', addNew);
+    document.getElementById('cmb_new').addEventListener('keydown', (e) => { if (e.key === 'Enter') addNew(); });
+    document.getElementById('cmb_selall').addEventListener('click', () => {
+        document.querySelectorAll('#cmb_list .cmb-chk').forEach((c) => { c.checked = true; });
+    });
+    document.getElementById('cmb_selnone').addEventListener('click', () => {
+        document.querySelectorAll('#cmb_list .cmb-chk').forEach((c) => { c.checked = false; });
+    });
+    document.getElementById('cmb_delsel').addEventListener('click', deleteSelected);
+}
+
+async function addNew() {
+    const inp = document.getElementById('cmb_new');
+    if (!inp) return;
+    const v = inp.value.trim();
+    if (!v) { notify('先输入要记的内容', 'warning'); return; }
+    if (await apiAdd(v)) { notify('已新增', 'success'); inp.value = ''; renderList(); }
+    else notify('新增失败', 'error');
+}
+
+async function deleteSelected() {
+    const ids = Array.from(document.querySelectorAll('#cmb_list .cmb-chk:checked'))
+        .map((c) => Number(c.dataset.id)).filter(Boolean);
+    if (!ids.length) { notify('没勾选任何一条', 'info'); return; }
+    if (!window.confirm('确定删除选中的 ' + ids.length + ' 条记忆？')) return;
+    let ok = 0;
+    for (const id of ids) { if (await apiDelete(id)) ok++; }
+    notify('已删除 ' + ok + ' 条', 'success');
+    renderList();
 }
 
 // ===== 启动 =====
