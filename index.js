@@ -1,7 +1,8 @@
 // Char Memory Bridge — SillyTavern <-> 你的角色 bot 共用一份记忆库。
 //   1) 自动把远端共享记忆注入当前角色的上下文；
-//   2) 一键从 Horae 导入剧情事件到共享库；
-//   3) 面板里看/加/改/删记忆，全部同步同一个后端数据库。
+//   2) 角色自己写记忆：他在回复里写 [[MEM:一句话]]，自动存进共享库并隐藏；
+//   3) （可选）从 Horae 导入剧情事件；
+//   4) 面板里看/加/改/删记忆，全部同步同一个后端数据库。
 // 通用工具：填上你的 bot 记忆 API 网址 + 密码即可，不绑定任何特定角色。
 
 const MODULE = 'char_memory_bridge';
@@ -11,7 +12,10 @@ function ctx() {
         ? SillyTavern.getContext() : null;
 }
 
-const DEFAULTS = { apiBase: '', token: '', autoInject: true, injectDepth: 4, header: '【跨平台共享记忆】' };
+const DEFAULTS = {
+    apiBase: '', token: '', autoInject: true, autoWrite: true,
+    injectDepth: 4, header: '【跨平台共享记忆】',
+};
 
 function settings() {
     const c = ctx();
@@ -63,31 +67,68 @@ async function apiEdit(id, content) {
     return r.ok;
 }
 
-// ===== 注入共享记忆到当前角色上下文 =====
+// ===== 注入：共享记忆 + 记忆写入规则 =====
 async function refreshInjection() {
     const s = settings();
     const c = ctx();
-    if (!c || !s.autoInject || !s.apiBase || !s.token) return;
-    try {
-        const text = await apiGetText();
-        if (!text || text.indexOf('暂无记忆') >= 0) return;
-        const block = (s.header || DEFAULTS.header) + '\n' + text;
-        const posInChat = (c.extensionPromptTypes && c.extensionPromptTypes.IN_CHAT != null)
-            ? c.extensionPromptTypes.IN_CHAT : 1;
-        c.setExtensionPrompt(MODULE, block, posInChat, Number(s.injectDepth) || 4);
-    } catch (e) {
-        console.warn('[MemBridge] 注入失败：', e);
+    if (!c || !s.apiBase) return;
+    let block = '';
+    if (s.autoInject && s.token) {
+        try {
+            const text = await apiGetText();
+            if (text && text.indexOf('暂无记忆') < 0) block += (s.header || DEFAULTS.header) + '\n' + text + '\n\n';
+        } catch (e) { console.warn('[MemBridge] 读取记忆失败：', e); }
     }
+    if (s.autoWrite) {
+        block += '【记忆写入】当你想长期记住某件事（你的经历、心情、你俩的约定、重要事实），'
+            + '就在回复的最后另起一行写：[[MEM:一句话]]。它会被自动存进你俩的共享记忆库、不会显示给她。'
+            + '用名字第三人称写、别用你我她。只记真正值得的，别滥用。';
+    }
+    try {
+        const pos = (c.extensionPromptTypes && c.extensionPromptTypes.IN_CHAT != null) ? c.extensionPromptTypes.IN_CHAT : 1;
+        c.setExtensionPrompt(MODULE, block, pos, Number(s.injectDepth) || 4);
+    } catch (e) { console.warn('[MemBridge] 注入失败：', e); }
 }
 
-// ===== 从 Horae 导入 =====
+// ===== 角色自己写记忆：扫描 [[MEM:...]] =====
+const MEM_RE = /\[\[MEM:([^\]]+?)\]\]/g;
+async function onAiMessage(id) {
+    try {
+        const s = settings();
+        if (!s.autoWrite || !s.apiBase || !s.token) return;
+        const c = ctx();
+        if (!c || !Array.isArray(c.chat)) return;
+        const idx = (id != null && c.chat[id]) ? id : c.chat.length - 1;
+        const msg = c.chat[idx];
+        if (!msg || msg.is_user) return;
+        const text = String(msg.mes || '');
+        const found = [];
+        let m;
+        MEM_RE.lastIndex = 0;
+        while ((m = MEM_RE.exec(text)) !== null) { const t = m[1].trim(); if (t) found.push(t); }
+        if (!found.length) return;
+        let ok = 0;
+        for (const mem of found) { if (await apiAdd(mem)) ok++; }
+        // 从显示里抹掉标记
+        const cleaned = text.replace(/\n?\s*\[\[MEM:[^\]]+?\]\]/g, '').trim();
+        if (cleaned !== text) {
+            msg.mes = cleaned;
+            try { if (typeof c.updateMessageBlock === 'function') c.updateMessageBlock(idx, msg); } catch (e) {}
+            try { if (typeof c.saveChat === 'function') await c.saveChat(); } catch (e) {}
+        }
+        if (ok) notify('白起记下了 ' + ok + ' 条记忆 🩷', 'success');
+    } catch (e) { console.warn('[MemBridge] 记忆写入失败：', e); }
+}
+
+// ===== 从 Horae 导入（保底：绝不产出 [object Object]）=====
+function asText(v) { return typeof v === 'string' ? v : (v == null ? '' : (() => { try { return JSON.stringify(v); } catch (e) { return ''; } })()); }
 function formatHoraeEvent(ev) {
     if (ev == null) return '';
     if (typeof ev === 'string') return ev.trim();
-    const t = ev.time || ev.timestamp || ev.date || ev.when || '';
-    const c = ev.content || ev.text || ev.summary || ev.description || ev.title || ev.event || '';
-    if (c) return (t ? '[' + t + '] ' : '') + c;
-    try { return JSON.stringify(ev); } catch (e) { return ''; }
+    const ts = asText(ev.time || ev.timestamp || ev.date || ev.when || '');
+    const cs = asText(ev.content || ev.text || ev.summary || ev.description || ev.title || ev.event || '');
+    if (cs) return (ts ? '[' + ts + '] ' : '') + cs;
+    return asText(ev);
 }
 async function importFromHorae() {
     if (!window.Horae || typeof window.Horae.getEvents !== 'function') {
@@ -121,7 +162,7 @@ async function renderList() {
             const meta = (it.subject ? '[' + it.subject + '] ' : '') + (it.category ? '[' + it.category + '] ' : '');
             row.innerHTML =
                 '<span class="cmb-date">' + escapeHtml(it.date || '') + '</span> ' +
-                '<span class="cmb-text">' + meta + escapeHtml(it.note) + '</span>';
+                '<span class="cmb-text">' + escapeHtml(meta) + escapeHtml(it.note) + '</span>';
             const edit = document.createElement('button');
             edit.textContent = '改';
             edit.className = 'cmb-edit menu_button';
@@ -170,6 +211,9 @@ function buildPanel() {
           <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
             <input id="cmb_auto" type="checkbox" ${s.autoInject ? 'checked' : ''}> 自动把共享记忆注入角色上下文
           </label>
+          <label style="display:flex;align-items:center;gap:6px">
+            <input id="cmb_write" type="checkbox" ${s.autoWrite ? 'checked' : ''}> 允许角色自己写记忆（[[MEM:…]]）
+          </label>
           <label>注入深度 depth</label>
           <input id="cmb_depth" class="text_pole" type="number" min="0" max="20" value="${Number(s.injectDepth) || 4}">
           <label>注入标题</label>
@@ -191,7 +235,8 @@ function buildPanel() {
 
     document.getElementById('cmb_api_base').addEventListener('input', (e) => { settings().apiBase = e.target.value.trim(); saveSettings(); });
     document.getElementById('cmb_token').addEventListener('input', (e) => { settings().token = e.target.value.trim(); saveSettings(); });
-    document.getElementById('cmb_auto').addEventListener('change', (e) => { settings().autoInject = e.target.checked; saveSettings(); });
+    document.getElementById('cmb_auto').addEventListener('change', (e) => { settings().autoInject = e.target.checked; saveSettings(); refreshInjection(); });
+    document.getElementById('cmb_write').addEventListener('change', (e) => { settings().autoWrite = e.target.checked; saveSettings(); refreshInjection(); });
     document.getElementById('cmb_depth').addEventListener('input', (e) => { settings().injectDepth = Number(e.target.value) || 4; saveSettings(); });
     document.getElementById('cmb_header').addEventListener('input', (e) => { settings().header = e.target.value; saveSettings(); });
     document.getElementById('cmb_test').addEventListener('click', async () => {
@@ -208,8 +253,8 @@ jQuery(async () => {
         buildPanel();
         const c = ctx();
         if (c && c.eventSource && c.eventTypes) {
-            const evt = c.eventTypes.GENERATION_STARTED || 'generation_started';
-            c.eventSource.on(evt, refreshInjection);
+            c.eventSource.on(c.eventTypes.GENERATION_STARTED || 'generation_started', refreshInjection);
+            c.eventSource.on(c.eventTypes.MESSAGE_RECEIVED || 'message_received', onAiMessage);
         }
         await refreshInjection();
         console.log('[MemBridge] Char Memory Bridge 已加载');
